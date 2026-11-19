@@ -1,1 +1,37 @@
+name: Build UWP
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: Blades-UWP-Netplay
+          submodules: recursive
+
+      - name: Configure
+        run: cmake --preset uwp
+
+      - name: Build
+        run: cmake --build --preset uwp-release -- /m
+
+      - name: List outputs
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Include *.exe,*.appx,*.msix,AppxManifest.xml build |
+            Select-Object -ExpandProperty FullName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xenia-uwp-build
+          path: |
+            build/**/*.exe
+            build/**/*.dll
+            build/**/*.appx
+            build/**/*.msix
+            build/**/AppxManifest.xml
+            build/**/Assets/**
+          if-no-files-found: warn
