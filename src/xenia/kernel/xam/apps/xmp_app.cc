@@ -436,6 +436,16 @@ X_HRESULT XmpApp::ExecuteDispatchMessage(uint32_t message, uint32_t buffer_ptr,
              uint32_t(args->object_ptr));
       return X_E_SUCCESS;
     }
+    case 0x0007003B: {
+      // Play a user playlist: [client:u32][XMP_USER_PLAYLIST_INFO...]
+      // id[0..3] of the info = playlist handle (big-endian).
+      if (!buffer_ptr || buffer_length < 8) {
+        return X_E_INVALIDARG;
+      }
+      const uint32_t playlist_handle = xe::load_and_swap<uint32_t>(buffer + 4);
+      XELOGI("XMP 0x7003B: play user playlist {:08X}", playlist_handle);
+      return XMPPlayTitlePlaylist(playlist_handle, 0);
+    }
     case 0x00070029: {
       // XMPGetPlaybackBehavior
       assert_true(!buffer_length ||
