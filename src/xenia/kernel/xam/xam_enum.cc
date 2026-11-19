@@ -7,7 +7,17 @@
  ******************************************************************************
  */
 
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "xenia/apu/audio_media_player.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/string.h"
+#include "xenia/emulator.h"
+#include "xenia/kernel/xam/apps/xmp_app.h"
+#include "xenia/vfs/entry.h"
+#include "xenia/vfs/virtual_file_system.h"
 #include "xenia/base/string_util.h"
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
@@ -82,6 +92,30 @@ dword_result_t XamEnumerate_entry(dword_t handle, dword_t flags,
 }
 DECLARE_XAM_EXPORT1(XamEnumerate, kNone, kImplemented);
 
+namespace {
+
+// Recherche recursive des .mp3 dans le systeme de fichiers virtuel (donc
+// compatible UWP / Xbox : on ne touche jamais au disque de l'hote).
+void CollectCustomMusic(vfs::Entry* dir, const std::string& vfs_path,
+                        std::vector<std::string>& out_paths) {
+  for (const auto& child : dir->children()) {
+    const std::string child_path = vfs_path + "\\" + child->name();
+    if (child->attributes() & 0x10) {  // FILE_ATTRIBUTE_DIRECTORY
+      CollectCustomMusic(child.get(), child_path, out_paths);
+      continue;
+    }
+    std::string lower = child->name();
+    for (auto& c : lower) {
+      if (c >= 'A' && c <= 'Z') c = char(c + 32);
+    }
+    if (lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".mp3") == 0) {
+      out_paths.push_back(child_path);
+    }
+  }
+}
+
+}  // namespace
+
 static uint32_t XMPCreateUserPlaylistEnumeratorHandle(
     uint32_t user_index, uint32_t app_id, uint32_t open_message,
     uint32_t close_message, uint32_t extra_size, uint32_t item_count,
@@ -97,6 +131,79 @@ static uint32_t XMPCreateUserPlaylistEnumeratorHandle(
   }
 
   std::vector<xam::XMP_USER_PLAYLIST_INFO> user_playlist_info = {};
+
+  // Une playlist par sous-dossier de D:\\custom_music (scan fait une seule fois).
+  static std::mutex custom_music_mutex;
+  static bool custom_music_scanned = false;
+  static std::vector<xam::XMP_USER_PLAYLIST_INFO> custom_music_infos;
+  {
+    std::lock_guard<std::mutex> lock(custom_music_mutex);
+    if (!custom_music_scanned) {
+      custom_music_scanned = true;
+      try {
+        vfs::Entry* root =
+            kernel_state()->file_system()->ResolvePath("D:\\custom_music");
+        if (!root) {
+          XELOGW("custom_music: D:\\custom_music introuvable");
+        } else {
+          uint32_t playlist_index = 0;
+          uint32_t next_song_handle = 0x10000;
+          for (const auto& dir : root->children()) {
+            if (!(dir->attributes() & 0x10)) {
+              continue;
+            }
+            const std::string dir_path = "D:\\custom_music\\" + dir->name();
+            std::vector<std::string> paths;
+            CollectCustomMusic(dir.get(), dir_path, paths);
+            XELOGI("custom_music: playlist '{}' has {} songs", dir->name(),
+                   paths.size());
+            if (paths.empty()) {
+              continue;  // une playlist vide fait planter Play()
+            }
+
+            auto playlist = std::make_unique<apps::XmpApp::Playlist>();
+            const uint32_t playlist_handle = 0x4000 + playlist_index;
+            const std::u16string dir_name = xe::to_utf16(dir->name());
+            playlist->handle = playlist_handle;
+            playlist->name = dir_name;
+            playlist->flags = 0;
+            uint32_t track_number = 0;
+            for (const auto& p : paths) {
+              auto song = std::make_unique<apps::XmpApp::Song>();
+              song->handle = next_song_handle++;
+              song->file_path = xe::to_utf16(p);
+              const size_t slash = p.find_last_of('\\');
+              std::string file =
+                  slash == std::string::npos ? p : p.substr(slash + 1);
+              song->name = xe::to_utf16(file.substr(0, file.size() - 4));
+              song->track_number = ++track_number;
+              song->duration_ms = 0;
+              song->format = apps::XmpApp::SongFormat::kMp3;
+              playlist->songs.push_back(std::move(song));
+            }
+
+            xam::XMP_USER_PLAYLIST_INFO info = {};
+            info.id[0] = uint8_t(playlist_handle >> 24);
+            info.id[1] = uint8_t(playlist_handle >> 16);
+            info.id[2] = uint8_t(playlist_handle >> 8);
+            info.id[3] = uint8_t(playlist_handle);
+            for (size_t i = 0;
+                 i < dir_name.size() && i + 1 < std::size(info.title); ++i) {
+              info.title[i] = dir_name[i];
+            }
+            custom_music_infos.push_back(info);
+
+            kernel_state()->emulator()->audio_media_player()->AddPlaylist(
+                playlist_handle, std::move(playlist));
+            ++playlist_index;
+          }
+        }
+      } catch (const std::exception& e) {
+        XELOGE("custom_music: scan failed: {}", e.what());
+      }
+    }
+    user_playlist_info = custom_music_infos;
+  }
 
   for (const auto& playlist_info : user_playlist_info) {
     e->AppendItem(playlist_info);
