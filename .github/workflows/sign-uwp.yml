@@ -1,0 +1,61 @@
+name: Sign UWP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  sign:
+    runs-on: windows-2022
+    steps:
+      - name: Download last successful Build UWP artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $id = gh run list --repo ${{ github.repository }} --workflow "Build UWP" --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+          Write-Host "Using run $id"
+          gh run download $id --repo ${{ github.repository }} --name xenia-uwp-build --dir in
+
+      - name: Sign package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $appx = Get-ChildItem in -Recurse -Filter "Xenia-Netplay-*.appx" | Select-Object -First 1
+          Write-Host "Package: $($appx.FullName)"
+
+          # Read the publisher from the package manifest (must match the certificate subject exactly)
+          Copy-Item $appx.FullName "$env:RUNNER_TEMP\pkg.zip"
+          Expand-Archive "$env:RUNNER_TEMP\pkg.zip" "$env:RUNNER_TEMP\pkg"
+          [xml]$m = Get-Content "$env:RUNNER_TEMP\pkg\AppxManifest.xml"
+          $publisher = $m.Package.Identity.Publisher
+          Write-Host "Publisher: $publisher"
+
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher `
+            -KeyUsage DigitalSignature -FriendlyName "Xenia UWP" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $pw = ConvertTo-SecureString -String "xenia" -Force -AsPlainText
+          New-Item -ItemType Directory out -Force | Out-Null
+          Export-PfxCertificate -Cert $cert -FilePath out\xenia.pfx -Password $pw | Out-Null
+          Export-Certificate -Cert $cert -FilePath out\xenia.cer | Out-Null
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match "\\x64\\" } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          Write-Host "signtool: $($signtool.FullName)"
+
+          Copy-Item $appx.FullName out\Xenia-Netplay-signed.appx
+          & $signtool.FullName sign /fd SHA256 /f out\xenia.pfx /p xenia out\Xenia-Netplay-signed.appx
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+          Remove-Item out\xenia.pfx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xenia-uwp-signed
+          path: |
+            out/Xenia-Netplay-signed.appx
+            out/xenia.cer
